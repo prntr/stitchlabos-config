@@ -94,14 +94,18 @@ class StitchlabIntake:
             "/server/stitchlab_intake/metadata", RequestType.GET,
             self._ep_metadata,
         )
-        self.server.register_notification("stitchlab_intake:status")
+        # Moonraker names the websocket method after the part behind the
+        # colon unless told otherwise, which would give a bare
+        # "notify_status". Mainsail listens for notify_stitchlab_intake_status.
+        self.server.register_notification(
+            "stitchlab_intake:status", "stitchlab_intake_status")
 
         self.server.register_event_handler(
             "server:klippy_ready", self._on_klippy_ready)
         self.server.register_event_handler(
             "server:klippy_disconnect", self._on_klippy_disconnect)
         self.server.register_event_handler(
-            "file_manager:file_uploaded", self._on_file_uploaded)
+            "file_manager:filelist_changed", self._on_filelist_changed)
 
     async def component_init(self) -> None:
         self.core.start()
@@ -193,10 +197,11 @@ class StitchlabIntake:
         return macros
 
     def _emit_event(self, name: str, payload: dict) -> None:
+        # The notification registered in __init__ forwards this event to
+        # websocket clients. Never reuse server:status_update: that is
+        # Klippy's printer-object stream, and Mainsail merges it into
+        # printer state.
         self.server.send_event(name, payload)
-        # Also push as a notification so Mainsail's WebSocket consumers
-        # can subscribe without server-side state.
-        self.server.send_event("server:status_update", {name: payload})
 
     # --- event handlers --------------------------------------------------
 
@@ -220,7 +225,14 @@ class StitchlabIntake:
         self._printing = is_printing
         self.core.set_printing(is_printing)
 
-    async def _on_file_uploaded(self, payload: dict) -> None:
+    async def _on_filelist_changed(self, payload: dict) -> None:
+        # Moonraker has no upload-specific event. A new upload arrives as
+        # create_file, an upload over an existing file as modify_file, a
+        # rename as move_file; the cache is keyed by basename, so all three
+        # need a fresh analysis.
+        if payload.get("action") not in ("create_file", "modify_file",
+                                          "move_file"):
+            return
         item = payload.get("item") or {}
         root = item.get("root")
         path = item.get("path") or ""
