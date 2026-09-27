@@ -25,6 +25,94 @@ if TYPE_CHECKING:
 
 SCRIPTS_PATH = "/home/pi/printer_data/scripts"
 
+# NetworkManager does not scan while wlan0 runs the access point, so
+# `nmcli device wifi list` shows only the AP itself. AccessPopup scans with
+# this exact command; the image's sudoers rule (020-stitchlab-wifi) allows
+# it without a password, so it must stay byte-for-byte identical.
+IW = "/usr/sbin/iw"
+IW_AP_SCAN = f"sudo -n {IW} dev wlan0 scan ap-force"
+
+
+def _dbm_to_quality(dbm: float) -> int:
+    """Signal in dBm to 0-100, the same mapping NetworkManager uses."""
+    dbm = min(max(dbm, -100.0), -40.0)
+    return int(100 - (100 * abs(dbm + 40)) / 60)
+
+
+def _iw_security(bss: Dict[str, Any]) -> str:
+    labels = []
+    if bss["wpa"]:
+        labels.append("WPA1")
+    if bss["rsn_psk"] or bss["rsn_8021x"]:
+        labels.append("WPA2")
+    if bss["rsn_sae"]:
+        labels.append("WPA3")
+    if bss["rsn_8021x"]:
+        labels.append("802.1X")
+    if not labels and bss["privacy"]:
+        labels.append("WEP")
+    return " ".join(labels) or "Open"
+
+
+def parse_iw_scan(output: str, saved: set[str]) -> list[Dict[str, Any]]:
+    """Turn `iw dev <if> scan` output into wifi_scan.sh's network entries.
+
+    One entry per SSID (the strongest BSS wins); hidden networks are skipped.
+    """
+    bss_list: list[Dict[str, Any]] = []
+    cur: Dict[str, Any] | None = None
+    section = ""
+    for raw in output.splitlines():
+        line = raw.strip()
+        if raw.startswith("BSS "):
+            cur = {"ssid": "", "dbm": -100.0, "privacy": False, "wpa": False,
+                   "rsn_psk": False, "rsn_sae": False, "rsn_8021x": False}
+            bss_list.append(cur)
+            section = ""
+            continue
+        if cur is None:
+            continue
+        if line.startswith("SSID:"):
+            cur["ssid"] = line[5:].strip()
+        elif line.startswith("signal:"):
+            m = re.match(r"signal:\s*(-?[\d.]+)", line)
+            if m:
+                cur["dbm"] = float(m.group(1))
+        elif line.startswith("capability:"):
+            cur["privacy"] = "Privacy" in line
+        elif line.startswith("RSN:"):
+            section = "rsn"
+        elif line.startswith("WPA:"):
+            section = "wpa"
+            cur["wpa"] = True
+        elif section == "rsn" and "Authentication suites:" in line:
+            suites = line.split(":", 1)[1]
+            cur["rsn_psk"] = "PSK" in suites
+            cur["rsn_sae"] = "SAE" in suites
+            cur["rsn_8021x"] = "IEEE 802.1X" in suites
+        elif not raw.startswith("\t\t") and section and ":" in line:
+            section = ""
+
+    best: Dict[str, Dict[str, Any]] = {}
+    for bss in bss_list:
+        ssid = bss["ssid"]
+        if not ssid or ssid.replace("\\x00", "") == "":
+            continue
+        if ssid not in best or bss["dbm"] > best[ssid]["dbm"]:
+            best[ssid] = bss
+    networks = [
+        {
+            "ssid": ssid,
+            "signal": _dbm_to_quality(bss["dbm"]),
+            "security": _iw_security(bss),
+            "in_use": False,
+            "saved": ssid in saved,
+        }
+        for ssid, bss in best.items()
+    ]
+    networks.sort(key=lambda n: n["signal"], reverse=True)
+    return networks
+
 
 class WiFiManager:
     def __init__(self, config: ConfigHelper) -> None:
@@ -157,8 +245,38 @@ class WiFiManager:
             logging.error(f"WiFiManager: Failed to parse status JSON: {e}")
             raise self.server.error(f"Failed to parse status: {e}", 500)
 
+    async def _wlan0_is_ap(self) -> bool:
+        try:
+            info = await self.shell_cmd.exec_cmd(
+                f"{IW} dev wlan0 info", timeout=5.0, log_complete=False
+            )
+        except self.shell_cmd.error:
+            return False
+        return re.search(r"^\s*type AP\s*$", info, re.MULTILINE) is not None
+
+    async def _scan_in_ap_mode(self) -> Dict[str, Any]:
+        try:
+            output = await self.shell_cmd.exec_cmd(
+                IW_AP_SCAN, timeout=20.0, log_complete=False
+            )
+        except self.shell_cmd.error as e:
+            logging.error(f"WiFiManager: AP-mode scan failed: {e}")
+            raise self.server.error(
+                "Scanning while the access point is active failed. The image "
+                "must allow this via /etc/sudoers.d/020-stitchlab-wifi.", 500)
+        try:
+            names = await self._run_nmcli(
+                "nmcli -t -f NAME connection show", timeout=10.0)
+        except self.server.error:
+            names = ""
+        saved = {n for n in names.splitlines() if n}
+        return {"networks": parse_iw_scan(output, saved)}
+
     async def _handle_scan(self, web_request: WebRequest) -> Dict[str, Any]:
         """Scan for available WiFi networks."""
+        if await self._wlan0_is_ap():
+            return await self._scan_in_ap_mode()
+
         # Force a rescan first
         try:
             await self.shell_cmd.exec_cmd(
