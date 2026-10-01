@@ -5,9 +5,11 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from __future__ import annotations
+import asyncio
 import logging
 import json
 import re
+import shlex
 
 from ..common import RequestType
 
@@ -31,6 +33,35 @@ SCRIPTS_PATH = "/home/pi/printer_data/scripts"
 # it without a password, so it must stay byte-for-byte identical.
 IW = "/usr/sbin/iw"
 IW_AP_SCAN = f"sudo -n {IW} dev wlan0 scan ap-force"
+
+WIFI_TYPE = "802-11-wireless"
+# Tried in this order when a password is set; SAE for WPA3-only networks.
+KEY_MGMT_CANDIDATES = ["wpa-psk", "sae"]
+
+
+def parse_connection_list(output: str) -> list[tuple[str, str]]:
+    """`nmcli -t -f UUID,TYPE connection show` into (uuid, type) pairs.
+
+    Neither field can contain a colon, so terse escaping never applies.
+    """
+    pairs = []
+    for line in output.splitlines():
+        uuid, sep, conn_type = line.strip().partition(":")
+        if sep and uuid:
+            pairs.append((uuid, conn_type))
+    return pairs
+
+
+def profile_matches(wanted: str, name: str, ssid: str, mode: str) -> bool:
+    """Whether a Wi-Fi client profile is the one meant by `wanted`.
+
+    By SSID, because add_network names a profile after a sanitised SSID
+    ("My Net" becomes "My_Net"); by name, because the page connects a saved
+    profile by its name. Access-point profiles never match.
+    """
+    if mode == "ap":
+        return False
+    return wanted in (ssid, name)
 
 
 def _dbm_to_quality(dbm: float) -> int:
@@ -120,6 +151,11 @@ class WiFiManager:
         self.shell_cmd: SCMDComp = self.server.load_component(
             config, 'shell_command'
         )
+        # add_network and connect both create profiles. Run them one at a
+        # time, so the second sees the profile the first created: the page
+        # sent both at once and NetworkManager ended up with two profiles of
+        # one name (commissioning run of 2026-09-28).
+        self._profile_lock = asyncio.Lock()
 
         # Register API endpoints
         self.server.register_endpoint(
@@ -236,6 +272,44 @@ class WiFiManager:
         """Run an nmcli command with sudo and return success plus output/error."""
         return await self._try_nmcli(f"sudo -n {cmd}", timeout=timeout)
 
+    async def _connection_value(self, uuid: str, field: str) -> str:
+        """One field of a connection, unescaped, or '' when unset."""
+        ok, out = await self._try_nmcli(
+            f"nmcli -e no -g {field} connection show uuid {shlex.quote(uuid)}",
+            timeout=10.0
+        )
+        return out.strip() if ok else ""
+
+    async def _find_wifi_profiles(self, wanted: str) -> list[str]:
+        """UUIDs of the Wi-Fi client profiles for an SSID or profile name."""
+        ok, out = await self._try_nmcli(
+            "nmcli -t -f UUID,TYPE connection show", timeout=10.0
+        )
+        if not ok:
+            raise self.server.error(f"Could not list connections: {out}", 500)
+        matches = []
+        for uuid, conn_type in parse_connection_list(out):
+            if conn_type != WIFI_TYPE:
+                continue
+            name = await self._connection_value(uuid, "connection.id")
+            ssid = await self._connection_value(uuid, "802-11-wireless.ssid")
+            mode = await self._connection_value(uuid, "802-11-wireless.mode")
+            if profile_matches(wanted, name, ssid, mode):
+                matches.append(uuid)
+        return matches
+
+    async def _set_password(self, uuid: str, password: str) -> None:
+        last_error = ""
+        for key_mgmt in KEY_MGMT_CANDIDATES:
+            ok, err = await self._try_nmcli_privileged(
+                f"nmcli connection modify uuid {shlex.quote(uuid)} "
+                f"wifi-sec.key-mgmt {key_mgmt} wifi-sec.psk {shlex.quote(password)}"
+            )
+            if ok:
+                return
+            last_error = err
+        raise self.server.error(f"Failed to set the password: {last_error}", 500)
+
     async def _handle_status(self, web_request: WebRequest) -> Dict[str, Any]:
         """Get current WiFi connection status."""
         output = await self._run_script("wifi_status.sh")
@@ -312,30 +386,27 @@ class WiFiManager:
         if not ssid:
             raise self.server.error("SSID is required", 400)
 
-        # Check if this is a saved profile
-        profiles_output = await self._run_script("wifi_profiles.sh")
-        try:
-            profiles_data = json.loads(profiles_output)
-            saved_profiles = [p["name"] for p in profiles_data.get("profiles", [])]
-        except (json.JSONDecodeError, KeyError):
-            saved_profiles = []
-
-        if ssid in saved_profiles:
-            # Connect to saved profile
-            cmd = f'nmcli connection up "{ssid}"'
-        elif password:
-            # Connect to new network with password
-            cmd = f'nmcli device wifi connect "{ssid}" password "{password}"'
-        else:
-            # Try connecting to open network or saved profile by SSID
-            cmd = f'nmcli device wifi connect "{ssid}"'
-
-        try:
-            result = await self._run_nmcli_privileged(cmd, timeout=60.0)
-            logging.info(f"WiFiManager: Connected to {ssid}")
-            return {"status": "connected", "ssid": ssid, "message": result}
-        except Exception as e:
-            raise self.server.error(f"Failed to connect to {ssid}: {e}", 500)
+        async with self._profile_lock:
+            try:
+                # A saved profile is activated, never created a second time.
+                uuids = await self._find_wifi_profiles(ssid)
+                if uuids:
+                    if len(uuids) > 1:
+                        logging.warning(
+                            f"WiFiManager: {len(uuids)} profiles for {ssid}, using {uuids[0]}")
+                    if password:
+                        await self._set_password(uuids[0], password)
+                    cmd = f"nmcli connection up uuid {shlex.quote(uuids[0])}"
+                elif password:
+                    cmd = (f"nmcli device wifi connect {shlex.quote(ssid)} "
+                           f"password {shlex.quote(password)}")
+                else:
+                    cmd = f"nmcli device wifi connect {shlex.quote(ssid)}"
+                result = await self._run_nmcli_privileged(cmd, timeout=60.0)
+            except Exception as e:
+                raise self.server.error(f"Failed to connect to {ssid}: {e}", 500)
+        logging.info(f"WiFiManager: Connected to {ssid}")
+        return {"status": "connected", "ssid": ssid, "message": result}
 
     async def _handle_disconnect(self, web_request: WebRequest) -> Dict[str, Any]:
         """Disconnect from current WiFi network."""
@@ -432,78 +503,64 @@ class WiFiManager:
         # Sanitize SSID for use as connection name
         conn_name = re.sub(r'[^a-zA-Z0-9_-]', '_', ssid)
 
-        try:
-            # Check for existing profile
-            exists, _ = await self._try_nmcli(
-                f'nmcli -t -f NAME connection show "{conn_name}"',
-                timeout=5.0
-            )
-
-            if password:
-                key_mgmt_candidates = ["wpa-psk", "sae"]
-                last_error = ""
-                if exists:
+        autoconnect_args = (
+            f'connection.autoconnect {"yes" if autoconnect else "no"} '
+            f'connection.autoconnect-priority {priority}'
+        )
+        async with self._profile_lock:
+            try:
+                # Look up by SSID first: a profile that connect created is
+                # named after the SSID itself, not after conn_name.
+                uuids = (await self._find_wifi_profiles(ssid)
+                         or await self._find_wifi_profiles(conn_name))
+                if uuids:
+                    uuid = uuids[0]
                     ok, err = await self._try_nmcli_privileged(
-                        f'nmcli connection modify "{conn_name}" wireless.ssid "{ssid}"'
+                        f"nmcli connection modify uuid {shlex.quote(uuid)} "
+                        f"wireless.ssid {shlex.quote(ssid)} {autoconnect_args}"
                     )
                     if not ok:
-                        raise self.server.error(f"Failed to update profile {conn_name}: {err}", 500)
-                    for key_mgmt in key_mgmt_candidates:
-                        ok, err = await self._try_nmcli_privileged(
-                            f'nmcli connection modify "{conn_name}" '
-                            f'wifi-sec.key-mgmt {key_mgmt} wifi-sec.psk "{password}"'
-                        )
-                        if ok:
-                            last_error = ""
-                            break
-                        last_error = err
+                        raise self.server.error(f"Failed to update profile for {ssid}: {err}", 500)
+                    if password:
+                        await self._set_password(uuid, password)
+                    profile = await self._connection_value(uuid, "connection.id") or conn_name
                 else:
-                    for key_mgmt in key_mgmt_candidates:
-                        ok, err = await self._try_nmcli_privileged(
-                            f'nmcli connection add type wifi con-name "{conn_name}" '
-                            f'ssid "{ssid}" wifi-sec.key-mgmt {key_mgmt} '
-                            f'wifi-sec.psk "{password}"'
-                        )
-                        if ok:
-                            last_error = ""
-                            break
-                        last_error = err
-                        # Clean up any partial profile before retrying
-                        await self._try_nmcli_privileged(f'nmcli connection delete "{conn_name}"', timeout=10.0)
-                if last_error:
-                    raise self.server.error(f"Failed to add network {ssid}: {last_error}", 500)
-            else:
-                if exists:
-                    ok, err = await self._try_nmcli_privileged(
-                        f'nmcli connection modify "{conn_name}" wireless.ssid "{ssid}"'
-                    )
-                    if not ok:
-                        raise self.server.error(f"Failed to update profile {conn_name}: {err}", 500)
-                else:
-                    ok, err = await self._try_nmcli_privileged(
-                        f'nmcli connection add type wifi con-name "{conn_name}" '
-                        f'ssid "{ssid}"'
-                    )
-                    if not ok:
-                        raise self.server.error(f"Failed to add network {ssid}: {err}", 500)
+                    await self._add_profile(conn_name, ssid, password, autoconnect_args)
+                    profile = conn_name
+            except Exception as e:
+                raise self.server.error(f"Failed to add network {ssid}: {e}", 500)
 
-            # Set autoconnect and priority
-            await self._run_nmcli_privileged(
-                f'nmcli connection modify "{conn_name}" '
-                f'connection.autoconnect {"yes" if autoconnect else "no"} '
-                f'connection.autoconnect-priority {priority}'
+        logging.info(f"WiFiManager: Saved network profile {profile}")
+        return {
+            "status": "added",
+            "ssid": ssid,
+            "profile": profile,
+            "autoconnect": autoconnect,
+            "priority": priority
+        }
+
+    async def _add_profile(self, conn_name: str, ssid: str,
+                           password: str | None, autoconnect_args: str) -> None:
+        base = (f"nmcli connection add type wifi con-name {shlex.quote(conn_name)} "
+                f"ssid {shlex.quote(ssid)} {autoconnect_args}")
+        if not password:
+            ok, err = await self._try_nmcli_privileged(base)
+            if not ok:
+                raise self.server.error(err, 500)
+            return
+        last_error = ""
+        for key_mgmt in KEY_MGMT_CANDIDATES:
+            ok, err = await self._try_nmcli_privileged(
+                f"{base} wifi-sec.key-mgmt {key_mgmt} wifi-sec.psk {shlex.quote(password)}"
             )
-
-            logging.info(f"WiFiManager: Added network profile {conn_name}")
-            return {
-                "status": "added",
-                "ssid": ssid,
-                "profile": conn_name,
-                "autoconnect": autoconnect,
-                "priority": priority
-            }
-        except Exception as e:
-            raise self.server.error(f"Failed to add network {ssid}: {e}", 500)
+            if ok:
+                return
+            last_error = err
+            # No profile of this name existed before, so this only removes a
+            # partial one from the failed attempt.
+            await self._try_nmcli_privileged(
+                f"nmcli connection delete id {shlex.quote(conn_name)}", timeout=10.0)
+        raise self.server.error(last_error, 500)
 
     async def _handle_set_priority(self, web_request: WebRequest) -> Dict[str, Any]:
         """Set the autoconnect priority for a profile."""
