@@ -34,6 +34,14 @@ SCRIPTS_PATH = "/home/pi/printer_data/scripts"
 IW = "/usr/sbin/iw"
 IW_AP_SCAN = f"sudo -n {IW} dev wlan0 scan ap-force"
 
+# AccessPopup's timer leaves the access point for any known network in range,
+# every two minutes. AP mode chosen on the Wi-Fi page lasted 11 s in the
+# 2026-09-28 commissioning run, so the timer is stopped while it is on. Both
+# lines are allowed without a password by 020-stitchlab-wifi; keep them
+# identical there.
+TIMER_STOP = "sudo -n /usr/bin/systemctl stop AccessPopup.timer"
+TIMER_START = "sudo -n /usr/bin/systemctl start AccessPopup.timer"
+
 WIFI_TYPE = "802-11-wireless"
 # Tried in this order when a password is set; SAE for WPA3-only networks.
 KEY_MGMT_CANDIDATES = ["wpa-psk", "sae"]
@@ -418,8 +426,13 @@ class WiFiManager:
             raise self.server.error(f"Failed to disconnect: {e}", 500)
 
     async def _handle_ap_enable(self, web_request: WebRequest) -> Dict[str, Any]:
-        """Enable Access Point mode."""
+        """Enable Access Point mode until it is disabled again."""
         ap_profile = web_request.get_str("profile", "AccessPopup")
+
+        ok, err = await self._try_nmcli(TIMER_STOP, timeout=10.0)
+        if not ok:
+            raise self.server.error(
+                f"Failed to enable AP mode: could not stop AccessPopup.timer: {err}", 500)
 
         try:
             # Disconnect any existing connection
@@ -429,15 +442,27 @@ class WiFiManager:
                 pass  # Ignore if already disconnected
 
             # Activate AP profile
-            cmd = f'nmcli connection up "{ap_profile}"'
+            cmd = f"nmcli connection up {shlex.quote(ap_profile)}"
             result = await self._run_nmcli_privileged(cmd, timeout=30.0)
             logging.info(f"WiFiManager: AP mode enabled with profile {ap_profile}")
             return {"status": "ap_enabled", "profile": ap_profile, "message": result}
         except Exception as e:
+            # Without the timer nothing would bring wlan0 back.
+            await self._try_nmcli(TIMER_START, timeout=10.0)
             raise self.server.error(f"Failed to enable AP mode: {e}", 500)
 
     async def _handle_ap_disable(self, web_request: WebRequest) -> Dict[str, Any]:
         """Disable Access Point mode and attempt to reconnect to WiFi."""
+        try:
+            return await self._leave_ap()
+        finally:
+            # Back to automatic fallback: with no known network in range,
+            # AccessPopup brings the access point back.
+            ok, err = await self._try_nmcli(TIMER_START, timeout=10.0)
+            if not ok:
+                logging.error(f"WiFiManager: could not start AccessPopup.timer: {err}")
+
+    async def _leave_ap(self) -> Dict[str, Any]:
         try:
             # Disconnect AP
             await self._run_nmcli_privileged("nmcli device disconnect wlan0", timeout=10.0)
@@ -447,7 +472,7 @@ class WiFiManager:
             try:
                 profiles_data = json.loads(profiles_output)
                 wifi_profiles = [
-                    p["name"] for p in profiles_data.get("profiles", [])
+                    p for p in profiles_data.get("profiles", [])
                     if p.get("type") == "wifi"
                 ]
             except (json.JSONDecodeError, KeyError):
@@ -455,13 +480,17 @@ class WiFiManager:
 
             if wifi_profiles:
                 # Try to connect to the first WiFi profile
+                profile = wifi_profiles[0]
+                if profile.get("uuid"):
+                    cmd = f"nmcli connection up uuid {shlex.quote(profile['uuid'])}"
+                else:
+                    cmd = f"nmcli connection up {shlex.quote(profile['name'])}"
                 try:
-                    cmd = f'nmcli connection up "{wifi_profiles[0]}"'
                     await self._run_nmcli_privileged(cmd, timeout=60.0)
-                    logging.info(f"WiFiManager: Reconnected to {wifi_profiles[0]}")
+                    logging.info(f"WiFiManager: Reconnected to {profile['name']}")
                     return {
                         "status": "reconnected",
-                        "ssid": wifi_profiles[0]
+                        "ssid": profile.get("ssid") or profile["name"]
                     }
                 except Exception:
                     pass

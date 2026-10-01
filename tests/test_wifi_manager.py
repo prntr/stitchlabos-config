@@ -77,6 +77,7 @@ class FakeNetworkManager:
                         "802-11-wireless.mode": "ap"},
         }
         self.commands = []
+        self.fail = set()   # command prefixes (joined args) that should fail
 
     def _create(self, name, ssid):
         uuid = f"uuid-{len(self.profiles)}"
@@ -88,6 +89,17 @@ class FakeNetworkManager:
         if args[:2] == ["sudo", "-n"]:
             args = args[2:]
         self.commands.append(args)
+        joined = " ".join(args)
+        if any(joined.startswith(prefix) for prefix in self.fail):
+            raise ShellError(f"failed: {joined}")
+        if args[0] == "/usr/bin/systemctl":
+            return ""
+        if args[0].endswith("/wifi_profiles.sh"):
+            return json.dumps({"profiles": [
+                {"name": "StitchlabSRV", "uuid": "uuid-1", "type": "wifi", "ssid": "StitchlabSRV"},
+            ]})
+        if args == ["nmcli", "device", "disconnect", "wlan0"]:
+            return ""
         if args == ["nmcli", "-t", "-f", "UUID,TYPE", "connection", "show"]:
             return "\n".join(f"{u}:802-11-wireless" for u in self.profiles) + "\n"
         if args[:4] == ["nmcli", "-e", "no", "-g"] and args[5:8] == ["connection", "show", "uuid"]:
@@ -101,7 +113,7 @@ class FakeNetworkManager:
             self._create(args[args.index("con-name") + 1], args[args.index("ssid") + 1])
             return "Connection successfully added."
         if args[:3] == ["nmcli", "connection", "modify"] or args[:3] == ["nmcli", "connection", "up"]:
-            if args[3] == "uuid" and args[4] not in self.profiles:
+            if args[3] == "uuid" and args[4] not in self.profiles and args[4] != "uuid-1":
                 raise ShellError(f"unknown connection {args[4]}")
             return ""
         raise ShellError(f"unexpected command: {args}")
@@ -292,3 +304,49 @@ def test_status_script_with_duplicate_names(tmp_path):
     assert status["connection"]["ip"] == "10.1.2.3"
     assert status["connection"]["signal"] == 78
     assert status["timer_active"] is True
+
+
+# --- AP mode against AccessPopup's timer --------------------------------------
+
+STOP = ["/usr/bin/systemctl", "stop", "AccessPopup.timer"]
+START = ["/usr/bin/systemctl", "start", "AccessPopup.timer"]
+
+
+def test_ap_enable_stops_the_timer_before_the_ap_comes_up():
+    # The timer left the AP for a known network 11 s after AP mode was chosen.
+    mgr, nm = manager()
+    run(mgr._handle_ap_enable(FakeRequest()))
+    assert nm.commands.index(STOP) < nm.commands.index(["nmcli", "connection", "up", "AccessPopup"])
+    assert START not in nm.commands
+
+
+def test_ap_enable_refuses_when_the_timer_cannot_be_stopped():
+    mgr, nm = manager()
+    nm.fail.add("/usr/bin/systemctl stop")
+    with pytest.raises(RuntimeError, match="AccessPopup.timer"):
+        run(mgr._handle_ap_enable(FakeRequest()))
+    assert ["nmcli", "connection", "up", "AccessPopup"] not in nm.commands
+
+
+def test_failed_ap_enable_restores_the_timer():
+    mgr, nm = manager()
+    nm.fail.add("nmcli connection up")
+    with pytest.raises(RuntimeError):
+        run(mgr._handle_ap_enable(FakeRequest()))
+    assert nm.commands[-1] == START
+
+
+def test_ap_disable_reconnects_by_uuid_and_restarts_the_timer():
+    mgr, nm = manager()
+    result = run(mgr._handle_ap_disable(FakeRequest()))
+    assert result == {"status": "reconnected", "ssid": "StitchlabSRV"}
+    assert ["nmcli", "connection", "up", "uuid", "uuid-1"] in nm.commands
+    assert nm.commands[-1] == START
+
+
+def test_ap_disable_restarts_the_timer_even_without_a_network():
+    mgr, nm = manager()
+    nm.fail.add("nmcli connection up")
+    result = run(mgr._handle_ap_disable(FakeRequest()))
+    assert result == {"status": "ap_disabled"}
+    assert nm.commands[-1] == START
